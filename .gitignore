@@ -1,0 +1,11 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+
+# CLI configuration files
+tfplan
+
+# Environment backend configuration files
+*.state.config
+

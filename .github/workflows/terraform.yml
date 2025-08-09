@@ -1,0 +1,203 @@
+# yamllint disable rule:line-length
+---
+name: Terraform
+
+"on":
+  pull_request:
+
+  push:
+    branches: ["main"]
+
+jobs:
+  determine-matrix:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: changes
+        uses: dorny/paths-filter@v2
+        with:
+          filters: |
+            terraform:
+              - '**/*.tf'
+              - '**/*.tfvars'
+              - 'environments.yml'
+              - '.terraform.lock.hcl'
+      - id: set-matrix
+        run: |
+          if [ "${{ steps.changes.outputs.terraform }}" != "true" ]; then
+            echo 'matrix=[{"name":"skip"}]' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          matrix=$(yq e -o=json '.environments | sort_by(.order)' environments.yml 2>/dev/null || echo '[]')
+          if [ "$matrix" = "[]" ]; then
+            echo 'matrix=[{"name":"skip"}]' >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          fi
+
+  tf-plan:
+    needs: determine-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: ${{ fromJSON(needs.determine-matrix.outputs.matrix) }}
+    permissions:
+      actions: read
+      checks: write
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      - name: Skip plan
+        if: matrix.environment.name == 'skip'
+        run: echo "No Terraform changes or environments to plan."
+      - name: Checkout repository
+        if: matrix.environment.name != 'skip'
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        if: matrix.environment.name != 'skip'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Create plugin cache
+        if: matrix.environment.name != 'skip'
+        run: |
+          mkdir -p $HOME/.terraform.d/plugin-cache
+          echo "TF_PLUGIN_CACHE_DIR=$HOME/.terraform.d/plugin-cache" >> $GITHUB_ENV
+
+      - name: Cache Terraform providers
+        if: matrix.environment.name != 'skip'
+        uses: actions/cache@v4
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: terraform-${{ runner.os }}-${{ hashFiles('.terraform.lock.hcl') }}
+
+      - name: Setup Terraform
+        if: matrix.environment.name != 'skip'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform plan ${{ matrix.environment.name }}
+        if: matrix.environment.name != 'skip'
+        uses: op5dev/tf-via-pr@v13
+        with:
+          working-directory: .
+          command: plan
+          arg-var-file: ${{ format('{0}/env/{1}.tfvars', github.workspace, matrix.environment.name) }}
+          arg-backend-config: ${{ format('{0}/env/{1}.state.config', github.workspace, matrix.environment.name) }}
+          plan-encrypt: ${{ secrets.TF_PASSPHRASE }}
+          validate: true
+          format: true
+
+  tf-plan-summary:
+    needs: [determine-matrix, tf-plan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: read
+    steps:
+      - name: Generate summary
+        id: summary
+        uses: actions/github-script@v7
+        env:
+          MATRIX: ${{ needs.determine-matrix.outputs.matrix }}
+        with:
+          script: |
+            const matrix = JSON.parse(process.env.MATRIX);
+            if (matrix[0].name === 'skip') {
+              core.setOutput('summary', 'No environments were deployed.');
+            } else {
+              const { data } = await github.rest.actions.listJobsForWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: context.runId,
+              });
+              const planJobs = data.jobs.filter(j => j.name.startsWith('tf-plan'))
+              const lines = planJobs.map(j => {
+                const name = j.name.replace('tf-plan (environment: ', '').replace(')', '');
+                return `- ${name}: ${j.conclusion}`;
+              });
+              core.setOutput('summary', lines.join('\n'));
+            }
+      - name: Comment summary
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          BODY: ${{ steps.summary.outputs.summary }}
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: process.env.BODY,
+            });
+      - name: Log summary
+        if: github.event_name != 'pull_request'
+        run: echo "${{ steps.summary.outputs.summary }}"
+
+  tf-apply:
+    needs: [determine-matrix, tf-plan-summary]
+    if: github.event_name == 'push' && fromJSON(needs.determine-matrix.outputs.matrix)[0].name != 'skip'
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      matrix:
+        environment: ${{ fromJSON(needs.determine-matrix.outputs.matrix) }}
+    environment: ${{ matrix.environment.name }}
+    permissions:
+      actions: read
+      checks: write
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Create plugin cache
+        run: |
+          mkdir -p $HOME/.terraform.d/plugin-cache
+          echo "TF_PLUGIN_CACHE_DIR=$HOME/.terraform.d/plugin-cache" >> $GITHUB_ENV
+
+      - name: Cache Terraform providers
+        uses: actions/cache@v4
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: terraform-${{ runner.os }}-${{ hashFiles('.terraform.lock.hcl') }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform apply ${{ matrix.environment.name }}
+        uses: op5dev/tf-via-pr@v13
+        with:
+          working-directory: .
+          command: apply
+          arg-lock: true
+          arg-var-file: ${{ format('{0}/env/{1}.tfvars', github.workspace, matrix.environment.name) }}
+          arg-backend-config: ${{ format('{0}/env/{1}.state.config', github.workspace, matrix.environment.name) }}
+          plan-encrypt: ${{ secrets.TF_PASSPHRASE }}
+          validate: true
+          format: true
