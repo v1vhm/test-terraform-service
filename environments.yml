@@ -9,3 +9,6 @@
 #     order: 2
 #   - name: prod
 #     order: 3
+environments:
+  - name: dev
+    order: 1
