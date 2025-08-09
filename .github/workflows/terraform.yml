@@ -45,6 +45,7 @@ jobs:
     needs: determine-matrix
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         environment: ${{ fromJSON(needs.determine-matrix.outputs.matrix) }}
     environment: ${{ matrix.environment.name }}
@@ -154,6 +155,7 @@ jobs:
     if: github.event_name == 'push' && fromJSON(needs.determine-matrix.outputs.matrix)[0].name != 'skip'
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: true
       max-parallel: 1
       matrix:
         environment: ${{ fromJSON(needs.determine-matrix.outputs.matrix) }}
