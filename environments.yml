@@ -12,3 +12,5 @@
 environments:
   - name: dev
     order: 1
+  - name: test
+    order: 2
